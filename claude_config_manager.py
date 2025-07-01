@@ -31,6 +31,47 @@ from rich.table import Table
 from rich.panel import Panel
 import yaml
 
+# ============================================================================
+# DSPy Configuration - Proper LM Integration
+# ============================================================================
+
+class OllamaDSPyClient(dspy.LM):
+    """Custom DSPy language model client for Ollama integration"""
+    
+    def __init__(self, model_name: str, ollama_client, **kwargs):
+        super().__init__(model_name, **kwargs)
+        self.model_name = model_name
+        self.ollama_client = ollama_client
+        self.history = []
+        
+    def basic_request(self, prompt: str, **kwargs) -> str:
+        """Make request to Ollama model through DSPy interface"""
+        try:
+            response = self.ollama_client.generate(
+                model=self.model_name,
+                prompt=prompt,
+                **kwargs
+            )
+            
+            content = response.get('response', '')
+            self.history.append({
+                'prompt': prompt,
+                'response': content,
+                'metadata': {
+                    'eval_count': response.get('eval_count', 0),
+                    'total_duration': response.get('total_duration', 0)
+                }
+            })
+            
+            return content
+            
+        except Exception as e:
+            logger.error(f"DSPy Ollama request failed: {e}")
+            raise RuntimeError(f"DSPy generation failed: {str(e)}")
+    
+    def __call__(self, prompt, **kwargs):
+        return self.basic_request(prompt, **kwargs)
+
 # Configure logging with rich formatting
 logging.basicConfig(
     level=logging.INFO, 
@@ -293,6 +334,68 @@ class OllamaModelManager:
             'moondream:latest': 1.7
         }
         
+        # DSPy integration
+        self.dspy_clients = {}
+        self._setup_dspy_integration()
+        
+    def _setup_dspy_integration(self):
+        """Setup DSPy language model integration"""
+        try:
+            # Get best available model for DSPy
+            primary_model = None
+            for category in ['reasoning', 'orchestration', 'general']:
+                for model in self.models[category]:
+                    if self._check_model_sync(model):
+                        primary_model = model
+                        break
+                if primary_model:
+                    break
+            
+            if primary_model:
+                # Create DSPy client
+                dspy_client = OllamaDSPyClient(
+                    model_name=primary_model,
+                    ollama_client=self.client
+                )
+                
+                # Configure DSPy with our Ollama client
+                dspy.configure(lm=dspy_client)
+                
+                self.dspy_clients[primary_model] = dspy_client
+                logger.info(f"✅ DSPy configured with primary model: {primary_model}")
+                
+                # Setup additional models for DSPy if resources allow
+                for model in self.models['reasoning'] + self.models['orchestration']:
+                    if model != primary_model and self._check_model_sync(model):
+                        self.dspy_clients[model] = OllamaDSPyClient(
+                            model_name=model,
+                            ollama_client=self.client
+                        )
+                        logger.info(f"✅ Additional DSPy client configured: {model}")
+            else:
+                logger.warning("⚠️  No models available for DSPy configuration")
+                
+        except Exception as e:
+            logger.error(f"❌ DSPy configuration failed: {e}")
+    
+    def _check_model_sync(self, model_name: str) -> bool:
+        """Synchronous model availability check for DSPy setup"""
+        try:
+            models = self.client.list()
+            available_models = [model['name'] for model in models['models']]
+            return model_name in available_models
+        except Exception:
+            return False
+    
+    def get_dspy_client(self, model_name: str = None) -> OllamaDSPyClient:
+        """Get DSPy client for specific model or default"""
+        if model_name and model_name in self.dspy_clients:
+            return self.dspy_clients[model_name]
+        elif self.dspy_clients:
+            return list(self.dspy_clients.values())[0]
+        else:
+            raise RuntimeError("No DSPy clients available")
+        
     async def check_model_availability(self, model_name: str) -> bool:
         """Check if a model is available locally"""
         try:
@@ -443,32 +546,525 @@ class OllamaModelManager:
             raise RuntimeError(f"Generation failed for model {model_name}: {str(e)}")
 
 # ============================================================================
-# DSPy Integration
+# DSPy Integration - Proper Implementation for Self-Improving System
 # ============================================================================
 
-class PromptGenerationSignature(dspy.Signature):
-    """Generate Claude.md content based on requirements"""
-    requirements = dspy.InputField(desc="Behavioral requirements and context")
-    existing_prompts = dspy.InputField(desc="Existing prompt library")
-    performance_data = dspy.InputField(desc="Performance metrics from logs")
-    claude_md_content = dspy.OutputField(desc="Generated Claude.md content")
-    supporting_files = dspy.OutputField(desc="Additional prompt files needed")
+class StrategyGenerationSignature(dspy.Signature):
+    """Generate high-level strategy for Claude configuration"""
+    requirements = dspy.InputField(desc="Behavioral requirements and technical constraints")
+    historical_performance = dspy.InputField(desc="Performance data from previous configurations")
+    strategy = dspy.OutputField(desc="High-level strategy for Claude.md generation")
+
+class ContentGenerationSignature(dspy.Signature):
+    """Generate Claude.md content based on strategy"""
+    strategy = dspy.InputField(desc="High-level strategy from strategy generator")
+    requirements = dspy.InputField(desc="Detailed behavioral requirements")
+    examples = dspy.InputField(desc="Examples of successful configurations")
+    claude_md_content = dspy.OutputField(desc="Complete Claude.md file content")
+
+class QualityAssessmentSignature(dspy.Signature):
+    """Assess quality of generated Claude configuration"""
+    claude_md_content = dspy.InputField(desc="Generated Claude.md content")
+    requirements = dspy.InputField(desc="Original requirements")
+    quality_score = dspy.OutputField(desc="Quality score from 0.0 to 1.0")
+    improvement_suggestions = dspy.OutputField(desc="Specific suggestions for improvement")
 
 class ClaudePromptOrchestrator(dspy.Module):
-    """DSPy module for orchestrating prompt generation"""
+    """Self-improving DSPy module for Claude configuration generation"""
     
     def __init__(self, model_manager: OllamaModelManager):
         super().__init__()
         self.model_manager = model_manager
-        self.prompt_generator = dspy.ChainOfThought(PromptGenerationSignature)
         
-    def forward(self, requirements, existing_prompts="", performance_data=""):
-        """Generate optimized Claude.md content"""
-        return self.prompt_generator(
+        # DSPy modules for different generation stages
+        self.strategy_generator = dspy.ChainOfThought(StrategyGenerationSignature)
+        self.content_generator = dspy.ChainOfThought(ContentGenerationSignature)
+        self.quality_assessor = dspy.ChainOfThought(QualityAssessmentSignature)
+        
+        # Track successful examples for continuous learning
+        self.successful_examples = []
+        self.performance_history = []
+        
+    def forward(self, requirements, historical_performance=""):
+        """Generate optimized Claude.md content using DSPy pipeline"""
+        
+        # Stage 1: Generate strategy
+        strategy_result = self.strategy_generator(
             requirements=requirements,
-            existing_prompts=existing_prompts,
-            performance_data=performance_data
+            historical_performance=historical_performance
         )
+        
+        # Stage 2: Generate content based on strategy
+        examples_text = self._format_successful_examples()
+        content_result = self.content_generator(
+            strategy=strategy_result.strategy,
+            requirements=requirements,
+            examples=examples_text
+        )
+        
+        # Stage 3: Assess quality
+        quality_result = self.quality_assessor(
+            claude_md_content=content_result.claude_md_content,
+            requirements=requirements
+        )
+        
+        return dspy.Prediction(
+            strategy=strategy_result.strategy,
+            claude_md_content=content_result.claude_md_content,
+            quality_score=quality_result.quality_score,
+            improvement_suggestions=quality_result.improvement_suggestions
+        )
+    
+    def _format_successful_examples(self) -> str:
+        """Format successful examples for few-shot learning"""
+        if not self.successful_examples:
+            return "No previous successful examples available."
+        
+        formatted = "Previous successful configurations:\n\n"
+        for i, example in enumerate(self.successful_examples[-5:], 1):  # Last 5 examples
+            formatted += f"Example {i}:\n"
+            formatted += f"Requirements: {example['requirements']}\n"
+            formatted += f"Strategy: {example['strategy'][:200]}...\n"
+            formatted += f"Performance Score: {example['performance_score']:.2f}\n\n"
+        
+        return formatted
+    
+    def add_successful_example(self, requirements: str, strategy: str, content: str, performance_score: float):
+        """Add successful example for future learning"""
+        example = {
+            'requirements': requirements,
+            'strategy': strategy,
+            'content': content,
+            'performance_score': performance_score,
+            'timestamp': datetime.now().isoformat()
+        }
+        self.successful_examples.append(example)
+        
+        # Keep only best examples (top 20 by performance)
+        if len(self.successful_examples) > 20:
+            self.successful_examples.sort(key=lambda x: x['performance_score'], reverse=True)
+            self.successful_examples = self.successful_examples[:20]
+
+# ============================================================================
+# DSPy Effectiveness Metrics - The Heart of Self-Improvement
+# ============================================================================
+
+class ClaudeEffectivenessMetric:
+    """Comprehensive metric system for evaluating Claude configuration effectiveness"""
+    
+    def __init__(self):
+        self.feedback_history = []
+        self.performance_weights = {
+            'content_quality': 0.3,      # Quality of generated Claude.md
+            'user_satisfaction': 0.25,   # User feedback scores
+            'task_completion': 0.2,      # How well it helps complete tasks
+            'response_consistency': 0.15, # Consistency in Claude behavior
+            'generation_efficiency': 0.1  # Speed and resource usage
+        }
+    
+    def __call__(self, example, prediction, trace=None) -> float:
+        """Main metric function called by DSPy optimization"""
+        try:
+            # Extract prediction components
+            if hasattr(prediction, 'claude_md_content'):
+                content = prediction.claude_md_content
+                quality_score = getattr(prediction, 'quality_score', 0.5)
+            else:
+                content = str(prediction)
+                quality_score = 0.5
+            
+            # Calculate individual metrics
+            metrics = {
+                'content_quality': self._evaluate_content_quality(content),
+                'user_satisfaction': self._evaluate_user_satisfaction(example, prediction),
+                'task_completion': self._evaluate_task_completion(example, content),
+                'response_consistency': self._evaluate_consistency(content),
+                'generation_efficiency': self._evaluate_efficiency(prediction, trace)
+            }
+            
+            # Weighted average
+            total_score = sum(
+                metrics[metric] * weight 
+                for metric, weight in self.performance_weights.items()
+            )
+            
+            # Store for future learning
+            self._store_evaluation(example, prediction, metrics, total_score)
+            
+            logger.info(f"📊 DSPy Metric Score: {total_score:.3f} | Breakdown: {metrics}")
+            
+            return total_score
+            
+        except Exception as e:
+            logger.error(f"Error in effectiveness metric: {e}")
+            return 0.0
+    
+    def _evaluate_content_quality(self, content: str) -> float:
+        """Evaluate quality of generated Claude.md content"""
+        if not content or len(content.strip()) < 100:
+            return 0.0
+        
+        quality_indicators = {
+            'has_structure': any(header in content for header in ['#', '##', '###']),
+            'has_instructions': any(word in content.lower() for word in ['instruction', 'guideline', 'rule']),
+            'has_examples': any(word in content.lower() for word in ['example', 'demonstrate', 'like this']),
+            'appropriate_length': 500 <= len(content) <= 5000,
+            'has_personality': any(word in content.lower() for word in ['personality', 'style', 'approach']),
+            'has_context': any(word in content.lower() for word in ['context', 'background', 'about'])
+        }
+        
+        quality_score = sum(quality_indicators.values()) / len(quality_indicators)
+        return min(1.0, quality_score * 1.2)  # Slight boost for meeting criteria
+    
+    def _evaluate_user_satisfaction(self, example, prediction) -> float:
+        """Evaluate based on user satisfaction patterns"""
+        # Look for satisfaction indicators in recent feedback
+        recent_feedback = self.feedback_history[-10:] if self.feedback_history else []
+        
+        if not recent_feedback:
+            return 0.7  # Neutral score when no feedback available
+        
+        # Average recent satisfaction scores
+        satisfaction_scores = [fb['satisfaction'] for fb in recent_feedback if 'satisfaction' in fb]
+        
+        if satisfaction_scores:
+            return sum(satisfaction_scores) / len(satisfaction_scores)
+        
+        return 0.7
+    
+    def _evaluate_task_completion(self, example, content: str) -> float:
+        """Evaluate how well the configuration helps complete intended tasks"""
+        # Extract task indicators from requirements
+        if hasattr(example, 'requirements'):
+            requirements = example.requirements.lower()
+        else:
+            requirements = str(example).lower()
+        
+        # Task completion indicators
+        task_indicators = {
+            'coding': ['code', 'programming', 'development', 'debug'],
+            'writing': ['write', 'content', 'creative', 'documentation'],
+            'analysis': ['analyze', 'research', 'data', 'review'],
+            'assistance': ['help', 'assist', 'support', 'guide']
+        }
+        
+        # Identify primary task type
+        primary_task = None
+        for task_type, keywords in task_indicators.items():
+            if any(keyword in requirements for keyword in keywords):
+                primary_task = task_type
+                break
+        
+        if not primary_task:
+            return 0.6  # Neutral for unclear tasks
+        
+        # Check if content addresses the task type
+        content_lower = content.lower()
+        relevant_keywords = task_indicators[primary_task]
+        keyword_matches = sum(1 for keyword in relevant_keywords if keyword in content_lower)
+        
+        return min(1.0, keyword_matches / len(relevant_keywords) + 0.3)
+    
+    def _evaluate_consistency(self, content: str) -> float:
+        """Evaluate consistency in tone and structure"""
+        # Simple consistency checks
+        consistency_indicators = {
+            'consistent_tone': self._check_tone_consistency(content),
+            'structured_format': self._check_structure_consistency(content),
+            'clear_sections': self._check_section_clarity(content)
+        }
+        
+        return sum(consistency_indicators.values()) / len(consistency_indicators)
+    
+    def _evaluate_efficiency(self, prediction, trace) -> float:
+        """Evaluate generation efficiency and resource usage"""
+        # If we have timing data from trace
+        if trace and hasattr(trace, 'generation_time'):
+            # Prefer faster generation (under 30 seconds gets full score)
+            time_score = max(0.0, min(1.0, (30 - trace.generation_time) / 30))
+        else:
+            time_score = 0.7  # Neutral when no timing data
+        
+        # Content length efficiency (not too short, not excessively long)
+        if hasattr(prediction, 'claude_md_content'):
+            content_length = len(prediction.claude_md_content)
+            length_score = 1.0 if 800 <= content_length <= 3000 else 0.6
+        else:
+            length_score = 0.7
+        
+        return (time_score + length_score) / 2
+    
+    def _check_tone_consistency(self, content: str) -> float:
+        """Check for consistent tone throughout content"""
+        # Simple heuristic: consistent sentence structure and vocabulary level
+        sentences = content.split('.')
+        if len(sentences) < 3:
+            return 0.5
+        
+        # Check for consistent sentence length variation
+        lengths = [len(s.strip()) for s in sentences if s.strip()]
+        if not lengths:
+            return 0.5
+        
+        avg_length = sum(lengths) / len(lengths)
+        variance = sum((l - avg_length) ** 2 for l in lengths) / len(lengths)
+        
+        # Lower variance indicates more consistent structure
+        consistency_score = max(0.0, min(1.0, 1.0 - (variance / 1000)))
+        return consistency_score
+    
+    def _check_structure_consistency(self, content: str) -> float:
+        """Check for consistent structural formatting"""
+        structure_elements = {
+            'headers': content.count('#'),
+            'lists': content.count('-') + content.count('*'),
+            'paragraphs': content.count('\n\n')
+        }
+        
+        # Good structure has balanced elements
+        if sum(structure_elements.values()) >= 5:
+            return 0.9
+        elif sum(structure_elements.values()) >= 2:
+            return 0.7
+        else:
+            return 0.4
+    
+    def _check_section_clarity(self, content: str) -> float:
+        """Check for clear, well-defined sections"""
+        # Look for clear section headers and organization
+        section_indicators = ['##', 'Instructions', 'Guidelines', 'Examples', 'Usage']
+        section_count = sum(1 for indicator in section_indicators if indicator in content)
+        
+        return min(1.0, section_count / 3)  # 3+ sections gets full score
+    
+    def add_user_feedback(self, config_name: str, satisfaction: float, comments: str = ""):
+        """Add user feedback for continuous improvement"""
+        feedback = {
+            'config_name': config_name,
+            'satisfaction': satisfaction,
+            'comments': comments,
+            'timestamp': datetime.now().isoformat()
+        }
+        self.feedback_history.append(feedback)
+        
+        # Keep only recent feedback (last 50 entries)
+        if len(self.feedback_history) > 50:
+            self.feedback_history = self.feedback_history[-50:]
+        
+        logger.info(f"📝 User feedback recorded: {satisfaction:.2f}/1.0 for {config_name}")
+    
+    def _store_evaluation(self, example, prediction, metrics: dict, total_score: float):
+        """Store evaluation results for analysis and debugging"""
+        evaluation = {
+            'timestamp': datetime.now().isoformat(),
+            'example_summary': str(example)[:200] + "..." if len(str(example)) > 200 else str(example),
+            'prediction_summary': str(prediction)[:200] + "..." if len(str(prediction)) > 200 else str(prediction),
+            'metrics': metrics,
+            'total_score': total_score
+        }
+        
+        # Could be stored to file or database for analysis
+        # For now, just log the key metrics
+        logger.debug(f"Evaluation stored: {total_score:.3f} | {metrics}")
+
+# ============================================================================
+# DSPy Optimization Framework - Self-Improving System
+# ============================================================================
+
+class DSPyOptimizationFramework:
+    """Framework for continuous DSPy optimization and self-improvement"""
+    
+    def __init__(self, orchestrator: 'ClaudePromptOrchestrator', model_manager: OllamaModelManager):
+        self.orchestrator = orchestrator
+        self.model_manager = model_manager
+        self.effectiveness_metric = ClaudeEffectivenessMetric()
+        
+        # Training data for optimization
+        self.training_examples = []
+        self.optimization_history = []
+        
+        # Optimization state
+        self.optimized_orchestrator = None
+        self.last_optimization_time = None
+        self.optimization_threshold = 0.75  # Trigger optimization when average score drops below this
+        
+    def add_training_example(self, requirements: str, historical_performance: str = ""):
+        """Add training example from successful configurations"""
+        example = dspy.Example(
+            requirements=requirements,
+            historical_performance=historical_performance
+        )
+        self.training_examples.append(example)
+        
+        # Keep training set manageable (last 100 examples)
+        if len(self.training_examples) > 100:
+            self.training_examples = self.training_examples[-100:]
+        
+        logger.info(f"📚 Training example added. Total examples: {len(self.training_examples)}")
+    
+    async def should_optimize(self) -> bool:
+        """Determine if optimization should be triggered"""
+        # Check if we have enough examples
+        if len(self.training_examples) < 5:
+            logger.info("📊 Not enough training examples for optimization (need 5+)")
+            return False
+        
+        # Check recent performance
+        recent_scores = []
+        for example in self.training_examples[-10:]:  # Last 10 examples
+            try:
+                # Generate prediction with current orchestrator
+                prediction = self.orchestrator(
+                    requirements=example.requirements,
+                    historical_performance=example.historical_performance
+                )
+                
+                # Evaluate with metric
+                score = self.effectiveness_metric(example, prediction)
+                recent_scores.append(score)
+                
+            except Exception as e:
+                logger.warning(f"Error evaluating example for optimization check: {e}")
+        
+        if recent_scores:
+            average_score = sum(recent_scores) / len(recent_scores)
+            logger.info(f"📊 Current average performance: {average_score:.3f}")
+            
+            # Trigger optimization if performance drops
+            if average_score < self.optimization_threshold:
+                logger.info(f"🔄 Performance below threshold ({self.optimization_threshold:.3f}), optimization recommended")
+                return True
+        
+        # Also optimize periodically (every 20 examples)
+        if len(self.training_examples) % 20 == 0:
+            logger.info("🔄 Periodic optimization triggered")
+            return True
+        
+        return False
+    
+    async def optimize_orchestrator(self) -> bool:
+        """Run DSPy optimization to improve the orchestrator"""
+        if len(self.training_examples) < 5:
+            logger.warning("⚠️  Not enough training examples for optimization")
+            return False
+        
+        try:
+            logger.info(f"🚀 Starting DSPy optimization with {len(self.training_examples)} examples...")
+            
+            # Create training and validation sets
+            train_size = int(len(self.training_examples) * 0.8)
+            trainset = self.training_examples[:train_size]
+            valset = self.training_examples[train_size:]
+            
+            if not valset:  # If too few examples, use some training examples for validation
+                valset = trainset[-2:]
+            
+            # Configure DSPy optimizer
+            optimizer = dspy.BootstrapFewShot(
+                metric=self.effectiveness_metric,
+                max_bootstrapped_demos=8,  # Number of examples to use for few-shot
+                max_labeled_demos=16,      # Maximum labeled examples
+                teacher=self.orchestrator  # Use current orchestrator as teacher
+            )
+            
+            # Run optimization
+            start_time = time.time()
+            optimized_orchestrator = optimizer.compile(
+                student=ClaudePromptOrchestrator(self.model_manager),
+                trainset=trainset,
+                valset=valset
+            )
+            optimization_time = time.time() - start_time
+            
+            # Evaluate improvement
+            improvement = await self._evaluate_optimization(optimized_orchestrator, valset)
+            
+            if improvement > 0.05:  # 5% improvement threshold
+                self.optimized_orchestrator = optimized_orchestrator
+                self.last_optimization_time = datetime.now()
+                
+                self.optimization_history.append({
+                    'timestamp': datetime.now().isoformat(),
+                    'improvement': improvement,
+                    'training_examples': len(trainset),
+                    'validation_examples': len(valset),
+                    'optimization_time': optimization_time
+                })
+                
+                logger.info(f"✅ Optimization successful! Improvement: {improvement:.3f} ({improvement*100:.1f}%)")
+                return True
+            else:
+                logger.info(f"📊 Optimization completed but improvement minimal: {improvement:.3f}")
+                return False
+                
+        except Exception as e:
+            logger.error(f"❌ Optimization failed: {e}")
+            logger.error(f"Traceback: {traceback.format_exc()}")
+            return False
+    
+    async def _evaluate_optimization(self, optimized_orchestrator, valset) -> float:
+        """Evaluate improvement from optimization"""
+        try:
+            # Evaluate original orchestrator
+            original_scores = []
+            for example in valset:
+                prediction = self.orchestrator(
+                    requirements=example.requirements,
+                    historical_performance=example.historical_performance
+                )
+                score = self.effectiveness_metric(example, prediction)
+                original_scores.append(score)
+            
+            # Evaluate optimized orchestrator
+            optimized_scores = []
+            for example in valset:
+                prediction = optimized_orchestrator(
+                    requirements=example.requirements,
+                    historical_performance=example.historical_performance
+                )
+                score = self.effectiveness_metric(example, prediction)
+                optimized_scores.append(score)
+            
+            original_avg = sum(original_scores) / len(original_scores) if original_scores else 0
+            optimized_avg = sum(optimized_scores) / len(optimized_scores) if optimized_scores else 0
+            
+            improvement = optimized_avg - original_avg
+            logger.info(f"📊 Evaluation: Original {original_avg:.3f} → Optimized {optimized_avg:.3f} (Δ{improvement:+.3f})")
+            
+            return improvement
+            
+        except Exception as e:
+            logger.error(f"Error evaluating optimization: {e}")
+            return 0.0
+    
+    def get_active_orchestrator(self) -> 'ClaudePromptOrchestrator':
+        """Get the currently active (potentially optimized) orchestrator"""
+        if self.optimized_orchestrator:
+            logger.debug("🎯 Using optimized orchestrator")
+            return self.optimized_orchestrator
+        else:
+            logger.debug("📝 Using original orchestrator")
+            return self.orchestrator
+    
+    def add_user_feedback(self, config_name: str, satisfaction: float, comments: str = ""):
+        """Add user feedback to improve future optimizations"""
+        self.effectiveness_metric.add_user_feedback(config_name, satisfaction, comments)
+        
+        # Add example for future training if satisfaction is high
+        if satisfaction >= 0.8:
+            # Create a training example from the successful configuration
+            # This would need the original requirements - could be stored separately
+            logger.info(f"🌟 High satisfaction feedback recorded for future training")
+    
+    def get_optimization_stats(self) -> dict:
+        """Get statistics about optimization performance"""
+        return {
+            'total_optimizations': len(self.optimization_history),
+            'training_examples': len(self.training_examples),
+            'last_optimization': self.last_optimization_time.isoformat() if self.last_optimization_time else None,
+            'average_improvement': sum(opt['improvement'] for opt in self.optimization_history) / len(self.optimization_history) if self.optimization_history else 0,
+            'is_optimized': self.optimized_orchestrator is not None
+        }
     
     async def generate_with_coordination(self, requirements: dict) -> CoordinatedResult:
         """Generate using multiple coordinated models with enhanced error handling"""
@@ -913,13 +1509,20 @@ class ClaudeConfigManager:
         try:
             self.model_manager = OllamaModelManager()
             self.orchestrator = ClaudePromptOrchestrator(self.model_manager)
+            
+            # Initialize DSPy optimization framework
+            self.optimization_framework = DSPyOptimizationFramework(
+                self.orchestrator, 
+                self.model_manager
+            )
+            
             self.generator = ClaudeMdGenerator(self.orchestrator)
             self.git_manager = GitVersionManager(str(self.workspace_path))
             self.log_analyzer = LogAnalyzer()
             self.performance_history = []
             self.config_cache = {}
             
-            logger.info(f"✅ Initialized Claude Config Manager with workspace: {self.workspace_path}")
+            logger.info(f"✅ Initialized Claude Config Manager with DSPy optimization: {self.workspace_path}")
             
             # Validate system requirements
             self._validate_system_requirements()
@@ -991,13 +1594,36 @@ class ClaudeConfigManager:
             with console.status("[bold green]Creating git branch..."):
                 await self.git_manager.create_configuration_branch(config.branch_name)
             
-            # Generate Claude.md content with progress tracking
+            # Check if optimization should be triggered
+            should_optimize = await self.optimization_framework.should_optimize()
+            if should_optimize:
+                with console.status("[bold yellow]Optimizing DSPy system for better performance..."):
+                    optimization_success = await self.optimization_framework.optimize_orchestrator()
+                    if optimization_success:
+                        console.print("[bold green]🎯 DSPy optimization completed successfully![/bold green]")
+                    else:
+                        console.print("[bold yellow]📊 DSPy optimization completed with minimal improvement[/bold yellow]")
+            
+            # Generate Claude.md content with progress tracking (using potentially optimized orchestrator)
             with console.status("[bold green]Generating Claude.md content..."):
+                # Update generator to use optimized orchestrator if available
+                active_orchestrator = self.optimization_framework.get_active_orchestrator()
+                self.generator.orchestrator = active_orchestrator
+                
                 claude_md_content = await self.generator.generate_claude_md(config)
             
             # Validate generated content
             if not self._validate_generated_content(claude_md_content):
                 logger.warning("⚠️  Generated content validation failed, proceeding with caution")
+            
+            # Add training example for future optimization
+            requirements_str = json.dumps({
+                'personality_traits': config.personality_traits,
+                'expertise_domains': config.expertise_domains,
+                'communication_style': config.communication_style,
+                'reasoning_approach': config.reasoning_approach
+            })
+            self.optimization_framework.add_training_example(requirements_str)
             
             # Save configuration metadata
             await self._save_config_metadata(config)
@@ -1476,6 +2102,17 @@ Examples:
     validate_parser.add_argument("--name", help="Configuration name (current if not specified)")
     validate_parser.add_argument("--fix", action="store_true", help="Attempt to fix issues")
     
+    # DSPy optimization commands
+    optimize_dspy_parser = subparsers.add_parser("optimize-dspy", help="Run DSPy optimization")
+    optimize_dspy_parser.add_argument("--force", action="store_true", help="Force optimization even if not recommended")
+    
+    feedback_parser = subparsers.add_parser("feedback", help="Provide feedback for DSPy optimization")
+    feedback_parser.add_argument("--config", required=True, help="Configuration name")
+    feedback_parser.add_argument("--satisfaction", type=float, required=True, help="Satisfaction score (0.0-1.0)")
+    feedback_parser.add_argument("--comments", help="Additional comments")
+    
+    dspy_status_parser = subparsers.add_parser("dspy-status", help="Show DSPy optimization status")
+    
     return parser
 
 async def main():
@@ -1596,6 +2233,48 @@ async def main():
             
         elif args.command == "validate":
             await manager._handle_validate_command(args)
+            
+        elif args.command == "optimize-dspy":
+            if args.force or await manager.optimization_framework.should_optimize():
+                with console.status("[bold yellow]Running DSPy optimization..."):
+                    success = await manager.optimization_framework.optimize_orchestrator()
+                if success:
+                    console.print("[bold green]🎯 DSPy optimization completed successfully![/bold green]")
+                    stats = manager.optimization_framework.get_optimization_stats()
+                    console.print(f"Total optimizations: {stats['total_optimizations']}")
+                    console.print(f"Average improvement: {stats['average_improvement']:.3f}")
+                else:
+                    console.print("[bold yellow]📊 DSPy optimization completed with minimal improvement[/bold yellow]")
+            else:
+                console.print("[yellow]📊 DSPy optimization not recommended at this time[/yellow]")
+                console.print("Use --force to optimize anyway")
+        
+        elif args.command == "feedback":
+            if not (0.0 <= args.satisfaction <= 1.0):
+                console.print("[red]❌ Satisfaction must be between 0.0 and 1.0[/red]")
+                return 1
+            
+            manager.optimization_framework.add_user_feedback(
+                args.config, 
+                args.satisfaction, 
+                args.comments or ""
+            )
+            console.print(f"[green]✅ Feedback recorded for '{args.config}': {args.satisfaction:.2f}/1.0[/green]")
+        
+        elif args.command == "dspy-status":
+            stats = manager.optimization_framework.get_optimization_stats()
+            
+            status_table = Table(title="DSPy Optimization Status", show_header=True, header_style="bold blue")
+            status_table.add_column("Metric", style="dim")
+            status_table.add_column("Value", justify="right")
+            
+            status_table.add_row("Total Optimizations", str(stats['total_optimizations']))
+            status_table.add_row("Training Examples", str(stats['training_examples']))
+            status_table.add_row("Is Optimized", "✅ Yes" if stats['is_optimized'] else "❌ No")
+            status_table.add_row("Average Improvement", f"{stats['average_improvement']:.3f}")
+            status_table.add_row("Last Optimization", stats['last_optimization'] or "Never")
+            
+            console.print(status_table)
             
         else:
             console.print(f"[red]❌ Unknown command: {args.command}[/red]")
